@@ -20,18 +20,6 @@ var LiveView = (() => {
     return a;
   };
   var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
-  var __objRest = (source, exclude) => {
-    var target = {};
-    for (var prop in source)
-      if (__hasOwnProp.call(source, prop) && exclude.indexOf(prop) < 0)
-        target[prop] = source[prop];
-    if (source != null && __getOwnPropSymbols)
-      for (var prop of __getOwnPropSymbols(source)) {
-        if (exclude.indexOf(prop) < 0 && __propIsEnum.call(source, prop))
-          target[prop] = source[prop];
-      }
-    return target;
-  };
   var __export = (target, all) => {
     for (var name in all)
       __defProp(target, name, { get: all[name], enumerable: true });
@@ -129,6 +117,7 @@ var LiveView = (() => {
   var LOADER_TIMEOUT = 1;
   var MAX_CHILD_JOIN_ATTEMPTS = 3;
   var BEFORE_UNLOAD_LOADER_TIMEOUT = 200;
+  var DISCONNECTED_TIMEOUT = 500;
   var BINDING_PREFIX = "phx-";
   var PUSH_TIMEOUT = 3e4;
   var DEBOUNCE_TRIGGER = "debounce-trigger";
@@ -544,12 +533,13 @@ var LiveView = (() => {
         case null:
           return callback();
         case "blur":
+          this.incCycle(el, "debounce-blur-cycle", () => {
+            if (asyncFilter()) {
+              callback();
+            }
+          });
           if (this.once(el, "debounce-blur")) {
-            el.addEventListener("blur", () => {
-              if (asyncFilter()) {
-                callback();
-              }
-            });
+            el.addEventListener("blur", () => this.triggerCycle(el, "debounce-blur-cycle"));
           }
           return;
         default:
@@ -3389,8 +3379,8 @@ removing illegal node: "${(childNode.outerHTML || childNode.nodeValue).trim()}"
     }
     return baseKey;
   };
-  var serializeForm = (form, metadata, onlyNames = []) => {
-    const _a = metadata, { submitter } = _a, meta = __objRest(_a, ["submitter"]);
+  var serializeForm = (form, opts, onlyNames = []) => {
+    const { submitter } = opts;
     let injectedElement;
     if (submitter && submitter.name) {
       const input = document.createElement("input");
@@ -3444,9 +3434,6 @@ removing illegal node: "${(childNode.outerHTML || childNode.nodeValue).trim()}"
     if (submitter && injectedElement) {
       submitter.parentElement.removeChild(injectedElement);
     }
-    for (let metaKey in meta) {
-      params.append(metaKey, meta[metaKey]);
-    }
     return params.toString();
   };
   var View = class _View {
@@ -3467,6 +3454,7 @@ removing illegal node: "${(childNode.outerHTML || childNode.nodeValue).trim()}"
       this.lastAckRef = null;
       this.childJoins = 0;
       this.loaderTimer = null;
+      this.disconnectedTimer = null;
       this.pendingDiffs = [];
       this.pendingForms = /* @__PURE__ */ new Set();
       this.redirect = false;
@@ -3575,6 +3563,7 @@ removing illegal node: "${(childNode.outerHTML || childNode.nodeValue).trim()}"
     }
     hideLoader() {
       clearTimeout(this.loaderTimer);
+      clearTimeout(this.disconnectedTimer);
       this.setContainerClasses(PHX_CONNECTED_CLASS);
       this.execAll(this.binding("connected"));
     }
@@ -3995,6 +3984,9 @@ removing illegal node: "${(childNode.outerHTML || childNode.nodeValue).trim()}"
       delete this.viewHooks[hookId];
     }
     applyPendingUpdates() {
+      if (this.liveSocket.hasPendingLink() && this.root.isMain()) {
+        return;
+      }
       this.pendingDiffs.forEach(({ diff, events }) => this.update(diff, events));
       this.pendingDiffs = [];
       this.eachChild((child) => child.applyPendingUpdates());
@@ -4124,9 +4116,6 @@ removing illegal node: "${(childNode.outerHTML || childNode.nodeValue).trim()}"
       }
       this.destroyAllChildren();
       this.liveSocket.dropActiveElement(this);
-      if (document.activeElement) {
-        document.activeElement.blur();
-      }
       if (this.liveSocket.isUnloaded()) {
         this.showLoader(BEFORE_UNLOAD_LOADER_TIMEOUT);
       }
@@ -4150,7 +4139,12 @@ removing illegal node: "${(childNode.outerHTML || childNode.nodeValue).trim()}"
       }
       this.showLoader();
       this.setContainerClasses(...classes);
-      this.execAll(this.binding("disconnected"));
+      this.delayedDisconnected();
+    }
+    delayedDisconnected() {
+      this.disconnectedTimer = setTimeout(() => {
+        this.execAll(this.binding("disconnected"));
+      }, this.liveSocket.disconnectedTimeout);
     }
     wrapPush(callerPush, receives) {
       let latency = this.liveSocket.getLatencySim();
@@ -4440,14 +4434,15 @@ removing illegal node: "${(childNode.outerHTML || childNode.nodeValue).trim()}"
         ], phxEvent, "change", opts);
       };
       let formData;
-      let meta = this.extractMeta(inputEl.form);
+      let meta = this.extractMeta(inputEl.form, {}, opts.value);
+      let serializeOpts = {};
       if (inputEl instanceof HTMLButtonElement) {
-        meta.submitter = inputEl;
+        serializeOpts.submitter = inputEl;
       }
       if (inputEl.getAttribute(this.binding("change"))) {
-        formData = serializeForm(inputEl.form, __spreadValues({ _target: opts._target }, meta), [inputEl.name]);
+        formData = serializeForm(inputEl.form, serializeOpts, [inputEl.name]);
       } else {
-        formData = serializeForm(inputEl.form, __spreadValues({ _target: opts._target }, meta));
+        formData = serializeForm(inputEl.form, serializeOpts);
       }
       if (dom_default.isUploadInput(inputEl) && inputEl.files && inputEl.files.length > 0) {
         LiveUploader.trackFiles(inputEl, Array.from(inputEl.files));
@@ -4457,6 +4452,7 @@ removing illegal node: "${(childNode.outerHTML || childNode.nodeValue).trim()}"
         type: "form",
         event: phxEvent,
         value: formData,
+        meta: __spreadValues({ _target: opts._target }, meta),
         uploads,
         cid
       };
@@ -4554,22 +4550,24 @@ removing illegal node: "${(childNode.outerHTML || childNode.nodeValue).trim()}"
           if (LiveUploader.inputsAwaitingPreflight(formEl).length > 0) {
             return this.undoRefs(ref, phxEvent);
           }
-          let meta = this.extractMeta(formEl);
-          let formData = serializeForm(formEl, __spreadValues({ submitter }, meta));
+          let meta = this.extractMeta(formEl, {}, opts.value);
+          let formData = serializeForm(formEl, { submitter });
           this.pushWithReply(proxyRefGen, "event", {
             type: "form",
             event: phxEvent,
             value: formData,
+            meta,
             cid
           }).then(({ resp }) => onReply(resp));
         });
       } else if (!(formEl.hasAttribute(PHX_REF_SRC) && formEl.classList.contains("phx-submit-loading"))) {
-        let meta = this.extractMeta(formEl);
-        let formData = serializeForm(formEl, __spreadValues({ submitter }, meta));
+        let meta = this.extractMeta(formEl, {}, opts.value);
+        let formData = serializeForm(formEl, { submitter });
         this.pushWithReply(refGenerator, "event", {
           type: "form",
           event: phxEvent,
           value: formData,
+          meta,
           cid
         }).then(({ resp }) => onReply(resp));
       }
@@ -4775,7 +4773,6 @@ removing illegal node: "${(childNode.outerHTML || childNode.nodeValue).trim()}"
       this.viewLogger = opts.viewLogger;
       this.metadataCallbacks = opts.metadata || {};
       this.defaults = Object.assign(clone(DEFAULTS), opts.defaults || {});
-      this.activeElement = null;
       this.prevActive = null;
       this.silenced = false;
       this.main = null;
@@ -4789,6 +4786,7 @@ removing illegal node: "${(childNode.outerHTML || childNode.nodeValue).trim()}"
       this.hooks = opts.hooks || {};
       this.uploaders = opts.uploaders || {};
       this.loaderTimeout = opts.loaderTimeout || LOADER_TIMEOUT;
+      this.disconnectedTimeout = opts.disconnectedTimeout || DISCONNECTED_TIMEOUT;
       this.reloadWithJitterTimer = null;
       this.maxReloads = opts.maxReloads || MAX_RELOADS;
       this.reloadJitterMin = opts.reloadJitterMin || RELOAD_JITTER_MIN;
